@@ -1,4 +1,4 @@
-dataset=CW
+dataset=wf_time_size_L65536
 
 python -u exp/train.py \
   --dataset ${dataset} \

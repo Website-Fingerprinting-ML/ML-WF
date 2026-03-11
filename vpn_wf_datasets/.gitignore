@@ -1,0 +1,21 @@
+# Raw capture files
+unzip_OG/
+vpn_UNfiltered/
+nonvpn_UNfiltered/
+extra_vpn/
+extra_vpn_udp/
+nonvpn_captures_filtered/
+
+# Intermediate NPZ data (large binary files)
+vpn_npz_time/
+vpn_npz_size/
+nonvpn_npz_time/
+nonvpn_npz_size/
+
+# Raw dataset downloads
+redownload/*.h5
+redownload/*.zip
+redownload/out_*.txt
+
+# macOS
+.DS_Store
