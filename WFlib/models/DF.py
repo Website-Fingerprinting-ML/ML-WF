@@ -42,23 +42,27 @@ class DF(nn.Module):
             ConvBlock(filter_num[2], filter_num[3], kernel_size, conv_stride_size, pool_size, pool_stride_size, 0.1, nn.ReLU)  # Block 4
         )
         
+        self.adapt = nn.AdaptiveAvgPool1d(length_after_extraction)
+        
         # Define the classifier part of the network
         self.classifier = nn.Sequential(
             nn.Flatten(),  # Flatten the tensor to a vector
             nn.Linear(filter_num[3] * length_after_extraction, 512, bias=False),  # Fully connected layer
             nn.BatchNorm1d(512),  # Batch normalization layer
             nn.ReLU(inplace=True),  # ReLU activation function
-            nn.Dropout(p=0.7),  # Dropout layer for regularization
+            nn.Dropout(p=0.3),  # Dropout layer for regularization
             nn.Linear(512, 512, bias=False),  # Fully connected layer
             nn.BatchNorm1d(512),  # Batch normalization layer
             nn.ReLU(inplace=True),  # ReLU activation function
-            nn.Dropout(p=0.5),  # Dropout layer for regularization
+            nn.Dropout(p=0.2),  # Dropout layer for regularization
             nn.Linear(512, num_classes)  # Output layer
         )
 
     def forward(self, x):
         # Pass the input through the feature extraction part
         x = self.feature_extraction(x)
+        
+        x = self.adapt(x)
         
         # Pass the output through the classifier part
         x = self.classifier(x)

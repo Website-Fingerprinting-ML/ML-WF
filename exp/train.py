@@ -92,7 +92,7 @@ if args.model in ["BAPM", "TMWF"]: # Assume num_tabs is known
     model = eval(f"models.{args.model}")(num_classes, args.num_tabs)
 else:
     model = eval(f"models.{args.model}")(num_classes)
-optimizer = eval(f"torch.optim.{args.optimizer}")(model.parameters(), lr=args.learning_rate)
+optimizer = eval(f"torch.optim.{args.optimizer}")(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
 
 if args.load_file is None:
     print("No pre-trained model")
