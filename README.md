@@ -64,8 +64,62 @@ pip install --user .
 ```sh
 mkdir datasets
 ```
+- Download VPN/Non-VPN datasets ([VNAT_release_1.zip (36 GB)](https://www.ll.mit.edu/r-d/datasets/vpnnonvpn-network-application-traffic-dataset-vnat)) and unzip into `./vpn_wf_datasets/unzip_OG/`
 
-- Download datasets ([link](https://zenodo.org/records/13732130)) and place it in the folder `./datasets`
+The raw dataset contains 162 pcap files across 10 traffic classes (rdp, skype-chat, youtube, netflix, rsync, scp, sftp, ssh, vimeo, voip) in both VPN and non-VPN variants. To produce the final `.npz` dataset used for training, the following preprocessing pipeline was applied from inside the `vpn_wf_datasets/` directory:
+
+**Step 1 — Filter non-VPN captures** (removes TCP noise):
+```sh
+# Reads from nonvpn_UNfiltered/, writes to nonvpn_captures_filtered/
+python filter_nonvpn_captures.py
+```
+Applies a tshark display filter: TCP-only, strips retransmissions, fast retransmissions, spurious retransmissions, duplicate ACKs, lost segments, out-of-order packets, and previous-segment-not-captured flags.
+
+**Step 2 — Filter VPN captures** (removes protocol noise):
+```sh
+# Reads from extra_vpn/, writes to extra_vpn_udp/
+python filter_vpn_captures.py
+```
+Removes DNS and ICMP packets from VPN traffic (VPN tunneling includes mixed protocol overhead).
+
+**Step 3 — Convert filtered pcaps to NPZ** (per-packet timestamps and sizes):
+
+Using a pcap-parsing tool (e.g. `dpkt` or `scapy`), extract per-packet arrival timestamps and byte sizes from each filtered pcap. Save each capture as a `.npz` file with keys `times` (1D float array) and `sizes` (1D float array) into the appropriate folder:
+```
+vpn_npz_time/       vpn_npz_size/
+nonvpn_npz_time/    nonvpn_npz_size/
+```
+After filtering, 3 traffic classes with sufficient packet counts were retained: **rdp**, **skype-chat**, **youtube** — 3 captures each for VPN and non-VPN (18 capture files total).
+
+**Step 4 — Build the combined dataset**:
+```sh
+# Run from vpn_wf_datasets/
+python build_data.py --root . --out_name new_wf_L65536 --L 65536 --num_windows 10
+```
+Pairs matching `time` and `size` npz files, concatenates them into a single `2*L = 131072`-length feature vector per window, and assigns a numeric label encoding both domain (VPN=1, non-VPN=0) and class. Labels are assigned as `domain_id * num_classes + class_id` (e.g., non-VPN rdp=0, VPN rdp=3). Sliding-window augmentation produces multiple samples per capture file.
+
+**Step 5 — Split into train/valid/test**:
+```sh
+python exp/dataset_process/dataset_split.py --dataset new_wf_L65536
+```
+
+The resulting dataset `new_wf_L65536.npz` has the following composition:
+
+| Traffic Class | VPN Samples | Non-VPN Samples | Total Samples | Label (non-VPN / VPN) |
+| --- | --- | --- | --- | --- |
+| rdp | 25 | 20 | 45 | 3 / 0 |
+| skype-chat | 3 | 3 | 6 | 4 / 1 |
+| youtube | 17 | 19 | 36 | 5 / 2 |
+| **Total** | **45** | **42** | **87** | — |
+
+- Each sample has shape `(131072,)` — the first 65536 values are packet timestamps, the next 65536 are packet sizes (zero-padded to length `L=65536`).
+- The `y` label encodes both whether the traffic is VPN-tunneled and the application type.
+- `compare_size_time_npz.py` can be used to verify that the `times` and `sizes` arrays for each capture have matching lengths before running `build_data.py`.
+- `view_npz.py` can be used to inspect the first few values of each npz capture file.
+
+OR
+
+- Download TOR datasets ([link](https://zenodo.org/records/13732130)) and place it in the folder `./datasets`
 
 | Datasets | # of monitored websites | # of instances | Intro |
 | --- | --- | --- | --- |
@@ -74,17 +128,6 @@ mkdir datasets
 | WTF-PAD.npz | 95 | 105730 | Dataset with WTF-PAD defense. [Details](https://arxiv.org/pdf/1512.00524) |
 | Front.npz |  95 | 95000 | Dataset with Front defense. [Details](https://www.usenix.org/system/files/sec20-gong.pdf) |
 | Walkie-Talkie.npz |  100 | 90000 | Dataset with Walkie-Talkie defense. [Details](https://www.usenix.org/system/files/conference/usenixsecurity17/sec17-wang-tao.pdf) |
-| TrafficSliver.npz |  95 | 95000 | Dataset with TrafficSliver defense. [Details](https://sebastianreuter.info/publications/pdf/ccs-trafficsliver.pdf) |
-| NCDrift_sup.npz |  93 | 21430 | Network condition drift dataset, including superior traces. [Details](https://arxiv.org/pdf/2309.10147) |
-| NCDrift_inf.npz |  93 | 6882 | Network condition drift dataset, including inferior traces. [Details](https://arxiv.org/pdf/2309.10147) |
-| Closed_2tab.npz |  100 | 58000 | 2-tab dataset in the closed-world scenario. [Details](http://www.thucsnet.com/wp-content/papers/xinhao_sp2023.pdf) |
-| Closed_3tab.npz |  100 | 58000 | 3-tab dataset in the closed-world scenario. [Details](http://www.thucsnet.com/wp-content/papers/xinhao_sp2023.pdf)  |
-| Closed_4tab.npz |  100 | 58000 | 4-tab dataset in the closed-world scenario. [Details](http://www.thucsnet.com/wp-content/papers/xinhao_sp2023.pdf)  |
-| Closed_5tab.npz |  100 | 58000 | 5-tab dataset in the closed-world scenario. [Details](http://www.thucsnet.com/wp-content/papers/xinhao_sp2023.pdf)  |
-| Open_2tab.npz |  100 | 64000 | 2-tab dataset in the open-world scenario. [Details](http://www.thucsnet.com/wp-content/papers/xinhao_sp2023.pdf)  |
-| Open_3tab.npz |  100 | 64000 | 3-tab dataset in the open-world scenario. [Details](http://www.thucsnet.com/wp-content/papers/xinhao_sp2023.pdf)  |
-| Open_4tab.npz |  100 | 64000 | 4-tab dataset in the open-world scenario. [Details](http://www.thucsnet.com/wp-content/papers/xinhao_sp2023.pdf) |
-| Open_5tab.npz |  100 | 64000 | 5-tab dataset in the open-world scenario. [Details](http://www.thucsnet.com/wp-content/papers/xinhao_sp2023.pdf) |
 
 
 - The extracted dataset is in npz format and contains two values: X and y. X represents the cell sequence, with values being the direction (e.g., 1 or -1) multiplied by the timestamp. y corresponds to the labels. Note that the input of some datasets consists only of direction sequences.

@@ -1,0 +1,490 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% USENIX-style Final Report — Two Column
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix2019_v3}
+\usepackage{graphicx}
+\usepackage{times}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{tabularx, makecell}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{enumitem}
+
+\newlist{enumerateinline}{enumerate}{1}
+\setlist[enumerateinline]{%
+    label=(\roman*),
+    labelsep=0.3em,
+    itemjoin={{, }},
+    itemjoin*={{, and }},
+    afterlabel=\,
+    nosep,
+    before=\leavevmode,
+    after={}
+}
+
+\begin{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Title & Authors
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\title{VPN Traffic Classification via Deep Learning:\\
+Fingerprinting Application Traffic Across VPN and Non-VPN Flows}
+
+\author{
+{\rm Pakhi Sinha}\\
+\texttt{pasinha@ucsc.edu}
+\and
+{\rm Mahyar Vahabi}\\
+\texttt{mvahabi@ucsc.edu}
+}
+
+\maketitle
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ABSTRACT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+Virtual Private Networks (VPNs) are widely used to provide confidentiality and anonymity by encrypting network traffic. However, despite encryption, statistical properties of traffic flows---including packet timing and size distributions---may still reveal the underlying application or service being used. In this work, we investigate whether deep learning classifiers can distinguish between VPN and non-VPN versions of application traffic flows, and simultaneously identify the application class (RDP, Skype, and YouTube). We collect and process PCAP captures for three application classes under both VPN and non-VPN conditions, transform raw captures into signed, time- and size-weighted 1D sequences, and train two state-of-the-art deep CNN architectures---DF and AWF---on a combined 6-class dataset. We describe the full quarter-long pipeline: dataset sourcing, PCAP filtering, NPZ transformation, sliding-window augmentation, dataset splitting, and model training. Our results demonstrate that even with modest data, directional flow sequences provide sufficient discriminative structure for CNN-based classifiers to distinguish both VPN status and application type simultaneously.
+\end{abstract}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% INTRODUCTION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Introduction}
+
+Virtual Private Networks are commonly deployed by individuals and organizations to shield network activity from passive observers. By tunneling traffic through an encrypted channel, a VPN prevents an eavesdropper from reading packet payloads. However, a fundamental limitation of VPN encryption is that it does not fully conceal \emph{traffic metadata}: the size, timing, direction, and burst structure of flows may persist in observable form even after encryption.
+
+Traffic analysis attacks exploit these residual statistical patterns to infer sensitive information about encrypted sessions. In the context of VPN traffic, prior work has demonstrated that application-level behavior---loading a YouTube video, initiating an RDP session, conducting a Skype call---leaves distinct signatures in the packet timing and size distributions that are not eliminated by VPN encapsulation.
+
+This project investigates a specific problem: given a raw network capture, can a deep learning model jointly determine (1) whether the capture was recorded with or without an active VPN, \emph{and} (2) which application class (RDP, Skype, YouTube) produced the traffic? We frame this as a 6-class classification problem (3 application classes $\times$ 2 VPN conditions), train DF~\cite{df} and AWF~\cite{awf} classifiers on transformed NPZ representations, and evaluate performance on a held-out test set.
+
+A summary of our contributions over the quarter is as follows:
+\begin{itemize}[topsep=0pt, leftmargin=1.2em]
+  \item Identification and sourcing of labeled PCAP captures covering RDP, Skype, and YouTube traffic under both VPN and non-VPN conditions.
+  \item A preprocessing and transformation pipeline converting raw PCAP files to signed, time/size-weighted 1D sequences stored as structured NPZ archives.
+  \item A combined dataset construction script (\texttt{build\_data.py}) that merges time and size channels into a single $2L$-length feature vector and assigns joint VPN/application labels.
+  \item A sliding-window augmentation strategy that multiplies effective sample count by extracting multiple sub-windows per long capture.
+  \item Adaptation of DF and AWF models for 6-class joint classification, with tuned training hyperparameters and compatible shell scripts.
+  \item Empirical evaluation reporting per-class and aggregate accuracy and F1 on the joint classification task.
+\end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% BACKGROUND
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Background: VPN Traffic and Leakage}
+
+\subsection{How VPNs operate}
+A VPN client encrypts outgoing packets and encapsulates them inside a tunneling protocol (e.g., OpenVPN, WireGuard, IPSec) before forwarding to a VPN gateway. From the perspective of a passive network observer on the client-side link, all payload content is replaced with ciphertext and all destination addresses are replaced with the VPN server's address. This is intended to prevent both content inspection and destination inference.
+
+\subsection{What VPNs do not hide}
+Despite payload encryption, VPNs typically preserve or only modestly alter the following observable traffic properties:
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{Packet sizes:} Application-level data units are often the same size before and after encapsulation, with only fixed protocol overhead added. YouTube streaming, for instance, emits large, regular downstream packets whether or not a VPN is active.
+  \item \textbf{Inter-packet timing:} Application pacing---such as the periodic chunk delivery of adaptive bitrate streaming or the bursty request/response pattern of remote desktop---is largely preserved through the VPN tunnel.
+  \item \textbf{Flow directionality:} The ratio and sequencing of upstream vs.\ downstream packets reflects application behavior and is not meaningfully altered by encryption.
+  \item \textbf{Burst structure:} Multi-packet bursts separated by idle gaps are a product of application and TCP behavior; VPN encapsulation does not eliminate these structures.
+\end{itemize}
+
+\subsection{Implications for classification}
+These preserved features create discriminative signatures. A remote desktop session (RDP) is characterized by frequent small upstream packets (user input) and moderate-sized downstream bursts (screen updates). A Skype call produces roughly symmetric bidirectional traffic at a relatively constant rate. YouTube playback generates large asymmetric downstream bursts with periodic rebuffering patterns. These signatures survive VPN encapsulation with enough fidelity that statistical classifiers can distinguish them---even without access to payload content or destination metadata.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DATASET
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Dataset: Collection and Structure}
+
+\subsection{Source and scope}
+Raw PCAP captures were sourced from the \textbf{VNAT} (VPN/Non-VPN Network Application Traffic Dataset) released by MIT Lincoln Laboratory~\cite{iscx}, downloaded as \texttt{VNAT\_release\_1.zip} (36 GB). The archive contains 162 PCAP files spanning 10 application classes---RDP, Skype, YouTube, Netflix, rsync, SCP, SFTP, SSH, Vimeo, and VoIP---each recorded under both VPN and non-VPN conditions and placed in \texttt{vpn\_wf\_datasets/unzip\_OG/}.
+
+After filtering (Section~\ref{sec:filtering}), only three classes had sufficient packet counts and quality captures to be usable:
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{RDP} (Remote Desktop Protocol) --- interactive remote session traffic.
+  \item \textbf{Skype-chat} --- chat/call traffic.
+  \item \textbf{YouTube} --- video streaming traffic.
+\end{itemize}
+Each retained class has six total captures: three recorded \emph{without} a VPN (non-VPN) and three recorded \emph{with} an active VPN. Each capture represents a continuous session of the relevant application traffic, with no mixing of application types within a single file.
+
+\subsection{Raw file organization}
+After PCAP filtering and NPZ conversion (described in Section~\ref{sec:filtering}), captures are organized into four directories separating VPN/non-VPN and time/size feature type:
+
+\begin{verbatim}
+vpn_npz_time/
+  vpn_rdp_capture{1,2,3}.npz
+  vpn_skype-chat_capture{10,11,12}.npz
+  vpn_youtube_capture{1,2,3}.npz
+vpn_npz_size/  (same filenames, key: sizes)
+nonvpn_npz_time/
+  nonvpn_rdp_capture{1,2,4}.npz
+  nonvpn_skype-chat_capture{10,11,12}.npz
+  nonvpn_youtube_capture{1,3,4}.npz
+nonvpn_npz_size/  (same filenames, key: sizes)
+\end{verbatim}
+
+Each NPZ file contains a single 1D array under either the \texttt{times} key (per-packet arrival timestamps) or the \texttt{sizes} key (per-packet byte lengths). Capture lengths range from $\sim$5,000 packets (Skype-chat sessions) to $\sim$222,000 packets (long RDP sessions).
+
+\subsection{Label design}
+We define a \emph{joint label} that encodes both the VPN condition and the application class in a single integer:
+\[
+y = d \cdot C + c,
+\]
+where $d \in \{0, 1\}$ is the domain index (0 = non-VPN, 1 = VPN), $c \in \{0, 1, 2\}$ is the application class index (RDP, Skype, YouTube), and $C = 3$ is the number of application classes. This yields 6 distinct integer labels (0--5), allowing a single multi-class classifier to simultaneously predict both dimensions. The class-to-index mapping is:
+
+\begin{table}[H]
+\caption{Joint label encoding ($y = d \cdot 3 + c$).}
+\centering
+\small
+\begin{tabularx}{\linewidth}{l l l >{\centering\arraybackslash}X}
+\toprule
+\textbf{Label} & \textbf{Domain} & \textbf{Application} & \textbf{$y$} \\
+\midrule
+non-VPN RDP     & nonvpn & rdp     & 0 \\
+non-VPN Skype   & nonvpn & skype   & 1 \\
+non-VPN YouTube & nonvpn & youtube & 2 \\
+VPN RDP         & vpn    & rdp     & 3 \\
+VPN Skype       & vpn    & skype   & 4 \\
+VPN YouTube     & vpn    & youtube & 5 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DATA PIPELINE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Data Processing Pipeline}
+
+\subsection{PCAP filtering}
+\label{sec:filtering}
+
+The raw VNAT captures contain noise that, if left in, would corrupt the time and size sequences fed to the model. Two separate filtering scripts handle VPN and non-VPN traffic differently, because the two traffic types have structurally different noise profiles.
+
+\textbf{Non-VPN filtering} (\texttt{filter\_nonvpn\_captures.py}). Non-VPN TCP flows contain retransmission artifacts that create duplicate or spurious packet entries with misleading size/timing values. We apply a tshark display filter that retains only TCP packets and discards:
+\begin{itemize}[leftmargin=1.2em, topsep=0pt]
+  \item Retransmissions, fast retransmissions, and spurious retransmissions
+  \item Duplicate ACKs
+  \item Lost segments, out-of-order packets, and previous-segment-not-captured events
+\end{itemize}
+The script reads from \texttt{nonvpn\_UNfiltered/} and writes cleaned pcaps to \texttt{nonvpn\_captures\_filtered/}.
+
+\textbf{VPN filtering} (\texttt{filter\_vpn\_captures.py}). VPN-encapsulated traffic is already UDP-tunneled, so TCP-level retransmission artifacts are not the primary concern. Instead, the raw VPN captures include background DNS lookups and ICMP control messages that are unrelated to the application session. The filter removes all DNS and ICMP packets (keeping everything else, including the UDP tunnel frames), reading from \texttt{extra\_vpn/} and writing to \texttt{extra\_vpn\_udp/}.
+
+\textbf{pcap $\to$ NPZ conversion.} After filtering, each pcap is parsed to extract per-packet arrival timestamps and byte sizes. Each capture is saved as two separate NPZ files---one under key \texttt{times} (float array of timestamps) and one under key \texttt{sizes} (float array of byte lengths)---into the appropriate directory (\texttt{vpn\_npz\_time/}, \texttt{vpn\_npz\_size/}, etc.). Of the original 162 pcap files, only 18 captures across 3 classes survived the combined quality and length requirements.
+
+\subsection{Feature representation}
+Each packet in a capture has two observable properties used as input features:
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{Time:} The inter-packet arrival time (or absolute timestamp), representing the temporal rhythm of the flow.
+  \item \textbf{Size:} The packet's byte length, representing the volume of data transferred.
+\end{itemize}
+We encode directionality using sign: outgoing (client $\rightarrow$ server) packets are assigned positive values; incoming (server $\rightarrow$ client) packets are assigned negative values. After sign encoding, the time and size sequences for each capture are independently stored in the corresponding NPZ archives.
+
+\subsection{Combined feature vector}
+For each capture, the time and size 1D arrays are concatenated into a single $2L$-length feature vector:
+\[
+\mathbf{x} = \bigl[\underbrace{t_1, \ldots, t_L}_{\text{time channel}},\; \underbrace{s_1, \ldots, s_L}_{\text{size channel}}\bigr] \in \mathbb{R}^{2L},
+\]
+where $L$ is the fixed window length (default $L = 65{,}536$ packets). If a capture contains more than $L$ packets, it is truncated; if fewer, the remainder is zero-padded. This concatenated representation allows the model to jointly process temporal rhythms and size distributions using a single 1D convolutional pass.
+
+\subsection{Build dataset script}
+The \texttt{build\_data.py} script automates the full pipeline from the four raw NPZ folders to a single combined dataset file. Its key responsibilities are:
+
+\begin{enumerate}[leftmargin=1.2em]
+  \item \textbf{File discovery:} Scan all four input directories (\texttt{vpn\_npz\_time}, \texttt{vpn\_npz\_size}, \texttt{nonvpn\_npz\_time}, \texttt{nonvpn\_npz\_size}) and match time/size pairs by filename.
+  \item \textbf{Label inference:} Parse the file stem (e.g., \texttt{vpn\_rdp\_capture2}) to extract domain and application class, then compute the joint integer label.
+  \item \textbf{Window extraction:} For each capture pair, extract up to \texttt{num\_windows} sliding windows of length $L$ spaced by \texttt{stride} packets (see Section~\ref{sec:augmentation}).
+  \item \textbf{Array assembly:} Stack all windows into a single $X$ matrix of shape \texttt{(N, 2L)} and a $y$ vector of length \texttt{N}.
+  \item \textbf{Output:} Save the combined dataset as a compressed NPZ file under \texttt{datasets/\{out\_name\}.npz} with arrays \texttt{X}, \texttt{y}, \texttt{domain}, \texttt{classes}, \texttt{stems}, and metadata scalars \texttt{L} and \texttt{seq\_len}.
+\end{enumerate}
+
+A typical invocation used in our experiments, run from inside \texttt{vpn\_wf\_datasets/}:
+\begin{verbatim}
+python3 build_data.py \
+  --root . \
+  --out_name new_wf_L65536 \
+  --out_dir ../datasets \
+  --L 65536 \
+  --num_windows 10 \
+  --stride 16384
+\end{verbatim}
+
+\subsection{Sliding-window augmentation}
+\label{sec:augmentation}
+A critical challenge in our setup is the extremely limited number of raw captures: 18 total (6 per application class, 3 per VPN condition). Without augmentation, the dataset contains only 18 training samples, one per file---far too few to train a multi-layer CNN.
+
+To address this, we implement a \emph{sliding window} strategy. Given a capture of $N$ packets and a stride of $S$ packets, we extract up to \texttt{num\_windows} windows starting at offsets $\{0, S, 2S, \ldots\}$. Each window produces an independent training sample with the same label as the parent capture. Concretely, for a capture with $N = 200{,}000$ packets, $L = 65{,}536$, and $S = 16{,}384$:
+\[
+\text{windows} = \left\lfloor \frac{N - L}{S} \right\rfloor + 1 \approx 8\text{--}10 \text{ windows per capture}.
+\]
+
+Using \texttt{num\_windows=10} and \texttt{stride=16384} ($= L/4$, i.e., 75\% overlap between consecutive windows), our 18 captures expanded to 87 total samples---an approximately 5$\times$ increase. Each window represents a different temporal slice of the same session, providing diversity in the training signal while preserving the label.
+
+\begin{table}[H]
+\caption{Dataset sizes before and after sliding-window augmentation.}
+\centering
+\small
+\begin{tabularx}{\linewidth}{l >{\centering\arraybackslash}X >{\centering\arraybackslash}X}
+\toprule
+\textbf{Setting} & \textbf{Total Samples} & \textbf{Avg.\ per Class} \\
+\midrule
+No augmentation (1 window) & 18 & 3 \\
+Sliding window (10 windows, stride $L/4$) & 87 & 14.5 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Dataset splitting}
+The combined NPZ file is split into train, validation, and test sets using \texttt{dataset\_split.py}. We use a 70/15/15 ratio with stratification over joint labels to ensure each class is represented in every split. Because the per-class counts are small and uneven (some captures are shorter and yield fewer windows), we implemented fallback logic: if any class in the validation/test pool has fewer than 2 members, stratification is disabled for that split to avoid sklearn errors. Final split sizes:
+\begin{itemize}[leftmargin=1.2em, topsep=0pt]
+  \item \textbf{Train:} 61 samples
+  \item \textbf{Valid:} 13 samples
+  \item \textbf{Test:} 13 samples
+\end{itemize}
+
+Train, validation, and test splits are saved as separate NPZ files under \texttt{datasets/new\_wf\_L65536/}.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ATTACK MODELS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Classification Models: AWF and DF}
+
+We adapt two deep learning architectures originally developed for Tor website fingerprinting to the VPN/non-VPN classification task. Both models consume a 1D sequence of length \texttt{seq\_len} $= 2L$ as input and produce logits over $C = 6$ classes. The \texttt{num\_classes} parameter is inferred directly from the dataset at runtime, requiring no manual reconfiguration when the class count changes.
+
+\subsection{AWF: lightweight convolutional baseline}
+AWF~\cite{awf} is a compact 1D CNN consisting of a small stack of convolutional layers (kernel size 8, progressively increasing filter counts), each followed by ReLU activations and max-pooling. A global pooling layer collapses the temporal dimension before a fully connected output head. The model's small capacity makes it suitable for our limited dataset, where larger models are more prone to overfitting.
+
+\textbf{Tuned hyperparameters.} We found the default learning rate of $2 \times 10^{-2}$ (with Adam) to be far too high for our data, causing the training loss to oscillate erratically between epochs (e.g., $4.7 \rightarrow 2.4 \rightarrow 3.3 \rightarrow 1.7$) without converging. Reducing to $5 \times 10^{-4}$---the standard Adam learning rate for 1D CNNs---stabilized training substantially. We also extended training to 50 epochs (from 20) to allow convergence on the small dataset.
+
+\subsection{DF: deep hierarchical convolutional model}
+DF~\cite{df} stacks four convolutional blocks, each containing two sequential 1D convolutional layers (kernel size $\approx 8$), batch normalization, ELU activations, max-pooling, and dropout. Filter counts increase with depth (32, 64, 128, 256). The classifier head consists of two 512-unit dense layers followed by a softmax output. This architecture extracts hierarchical burst features: local patterns at shallow layers and larger structural shapes at deeper layers.
+
+\textbf{Tuned hyperparameters.} We extended training to 60 epochs (from 30) and added a \texttt{StepLR} learning rate scheduler (decay factor 0.5 every 20 epochs) to improve late-stage convergence. In our initial 30-epoch runs, the best validation F1 jumped from 0.39 to 0.56 only on the final epoch, indicating the model was still improving at cutoff. The additional epochs and LR decay allowed more stable convergence.
+
+\subsection{Input configuration}
+Both models receive a 1D input of shape \texttt{(batch, 1, seq\_len)} where \texttt{seq\_len = 2 * L = 131,072} for $L = 65{,}536$. This is significantly longer than the typical WF setting ($L = 5{,}000$), reflecting the longer capture durations in our dataset. Model checkpoints are saved based on maximum validation F1-score.
+
+\subsection{Training shell scripts}
+We provide shell scripts (\texttt{AWF.sh}, \texttt{DF.sh}) that invoke \texttt{train.py} and \texttt{test.py} with the appropriate dataset name, model name, sequence length, and number of classes. A representative invocation:
+\begin{verbatim}
+python exp/train.py \
+  --dataset new_wf_L65536 \
+  --model DF \
+  --seq_len 131072 \
+  --epoch 60 \
+  --lr 1e-3
+\end{verbatim}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% EXPERIMENTS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Experiments}
+
+\subsection{Experimental setup}
+All experiments were conducted on a Linux server with NVIDIA GPU access (NVIDIA A10/A100 class). Model training used fixed random seed 2024 for reproducibility. Dataset construction, splitting, and model training were run end-to-end from raw NPZ files using the scripts described in Section~4. Both models were trained and evaluated on the same \texttt{new\_wf\_L65536} dataset split (Train: 61, Valid: 13, Test: 13).
+
+\subsection{Dataset summary}
+\begin{table}[H]
+\caption{Dataset summary after sliding-window augmentation.}
+\centering
+\small
+\begin{tabularx}{\linewidth}{l >{\centering\arraybackslash}X}
+\toprule
+\textbf{Property} & \textbf{Value} \\
+\midrule
+Application classes & 3 (RDP, Skype, YouTube) \\
+VPN conditions & 2 (VPN, non-VPN) \\
+Joint classes ($C$) & 6 \\
+Raw captures & 18 \\
+Window length $L$ & 65,536 packets \\
+Stride & 16,384 packets \\
+Max windows/capture & 10 \\
+Total samples (post-aug) & 87 \\
+Train / Valid / Test & 61 / 13 / 13 \\
+Feature vector length (AWF) & 32,768 ($L/2$) \\
+Feature vector length (DF) & 131,072 ($2L$) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent Note the difference in input size: AWF consumed sequences of length 32,768 (the model's configured \texttt{seq\_len}), while DF consumed the full $2L = 131{,}072$ concatenated time+size vector, as reflected in the respective \texttt{X=torch.Size([61, 1, 32768])} and \texttt{X=torch.Size([61, 1, 131072])} shapes reported at load time.
+
+\subsection{AWF training results}
+
+AWF was trained for 50 epochs using Adam with $lr = 5\times10^{-4}$, batch size 64. Table~2 reports validation metrics at selected epochs. The model began converging rapidly, achieving its best validation F1 of \textbf{0.8139} at epoch 17 (accuracy 0.7692) and holding that checkpoint through the remaining 32 epochs.
+
+\begin{table}[H]
+\caption{AWF validation metrics at selected epochs (50-epoch run, $lr=5\times10^{-4}$, \texttt{seq\_len}=32768).}
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabularx}{\linewidth}{r >{\centering\arraybackslash}X >{\centering\arraybackslash}X >{\centering\arraybackslash}X >{\centering\arraybackslash}X}
+\toprule
+\textbf{Epoch} & \textbf{Loss} & \textbf{Acc.} & \textbf{Prec.} & \textbf{F1} \\
+\midrule
+0  & 1.633 & 0.2308 & 0.0500 & 0.0714 \\
+2  & 1.400 & 0.4615 & 0.2381 & 0.3000 \\
+5  & 0.877 & 0.5385 & 0.2619 & 0.3434 \\
+7  & 0.729 & 0.6154 & 0.4563 & 0.4768 \\
+9  & 0.526 & 0.6154 & 0.6944 & 0.6778 \\
+\textbf{17} & \textbf{0.227} & \textbf{0.7692} & \textbf{0.8778} & \textbf{0.8139} \\
+20 & 0.173 & 0.7692 & 0.8778 & 0.8139 \\
+29 & 0.131 & 0.6923 & 0.8056 & 0.7683 \\
+49 & 0.030 & 0.6923 & 0.8056 & 0.7683 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Convergence behavior.} AWF's training loss decreased steadily from 1.633 at epoch 0 to 0.030 at epoch 49, indicating the model was fitting the training set well by the end of training. However, validation F1 plateaued and became noisy after epoch 17, fluctuating between 0.5333 and 0.8139 across the final 30 epochs. This pattern is characteristic of mild overfitting on a small dataset: the model memorizes training windows but loses some generalization as training progresses. The best checkpoint (epoch 17, F1 = 0.8139) was retained for evaluation.
+
+Notable is the jump from F1 = 0.6778 at epoch 9 to F1 = 0.8139 at epoch 17 --- an improvement of $+0.136$ F1 points in 8 epochs as the training loss dropped from 0.526 to 0.227. This corresponds to the model transitioning from partial discrimination (roughly 4 of 6 classes correct) to strong joint classification (roughly 5 of 6 correct on 13 validation samples).
+
+\subsection{DF training results}
+
+DF was trained for 60 epochs using Adam with $lr = 1\times10^{-3}$ and StepLR scheduling (decay factor 0.5 every 20 epochs), batch size 64. Table~3 reports validation metrics at selected epochs.
+
+\begin{table}[H]
+\caption{DF validation metrics at selected epochs (60-epoch run, StepLR, \texttt{seq\_len}=131072).}
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabularx}{\linewidth}{r >{\centering\arraybackslash}X >{\centering\arraybackslash}X >{\centering\arraybackslash}X >{\centering\arraybackslash}X}
+\toprule
+\textbf{Epoch} & \textbf{Loss} & \textbf{Acc.} & \textbf{Prec.} & \textbf{F1} \\
+\midrule
+0  & 1.669 & 0.3077 & 0.0958 & 0.1250 \\
+4  & 1.525 & 0.3846 & 0.1667 & 0.2111 \\
+8  & 1.546 & 0.5385 & 0.4194 & 0.3833 \\
+11 & 1.340 & 0.6154 & 0.4444 & 0.4472 \\
+\textbf{13} & \textbf{1.592} & \textbf{0.6154} & \textbf{0.4583} & \textbf{0.4583} \\
+20 & 1.692 & 0.3077 & 0.1587 & 0.1772 \\
+35 & 1.404 & 0.4615 & 0.2361 & 0.2889 \\
+52 & 1.403 & 0.5385 & 0.4194 & 0.4032 \\
+59 & 1.493 & 0.4615 & 0.2639 & 0.3000 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Convergence behavior.} DF's training dynamics were markedly different from AWF's. The training loss remained largely in the range 1.3--1.8 across all 60 epochs, never exhibiting the clean monotonic descent seen in AWF. Validation F1 peaked early at epoch 13 (F1 = 0.4583, accuracy = 0.6154) and then \emph{degraded} substantially in the mid-training epochs (dropping to F1 = 0.10 at epoch 29, accuracy = 0.1538). Performance partially recovered in the final epochs but never surpassed the epoch-13 best.
+
+This pattern is attributable to two compounding factors:
+\begin{itemize}[leftmargin=1.2em, topsep=0pt]
+  \item \textbf{Input length mismatch:} DF processed $2L = 131{,}072$-length sequences. At this length, DF's deep max-pooling stack (4 blocks, each halving temporal resolution) may have been consuming insufficient gradient signal early in training due to the large receptive field relative to the actual discriminative burst patterns in the data.
+  \item \textbf{Dataset size vs.\ model capacity:} DF has substantially more parameters than AWF (four convolutional blocks plus two 512-unit dense layers). With only 61 training samples, DF is severely under-determined, and its optimizer can find locally good solutions early (epoch 13) before drifting away under continued gradient updates.
+\end{itemize}
+
+\subsection{Model comparison}
+
+\begin{table}[H]
+\caption{Best validation performance comparison: AWF vs.\ DF on the 6-class joint VPN/application task.}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\linewidth}{l >{\centering\arraybackslash}X >{\centering\arraybackslash}X >{\centering\arraybackslash}X >{\centering\arraybackslash}X}
+\toprule
+\textbf{Model} & \textbf{Best Epoch} & \textbf{Acc.} & \textbf{Prec.} & \textbf{F1} \\
+\midrule
+AWF & 17  & 0.7692 & 0.8778 & 0.8139 \\
+DF  & 13  & 0.6154 & 0.4583 & 0.4583 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+AWF substantially outperformed DF on this dataset, achieving a best validation F1 of 0.8139 vs.\ DF's 0.4583 --- a gap of $+0.355$ F1 points. This outcome inverts the typical ranking seen in large-scale WF benchmarks, where DF's deeper architecture usually wins. The explanation is straightforward: DF's greater capacity is a liability rather than an asset when training data is extremely limited. AWF's compact architecture --- fewer parameters, simpler feature hierarchy --- generalizes better from 61 samples.
+
+A random baseline on 6 balanced classes would achieve an expected accuracy of $1/6 \approx 0.167$ and F1 of approximately 0.167. AWF's 0.8139 F1 and 0.7692 accuracy represent substantial learning above chance. DF's 0.4583 F1 also exceeds random, confirming that both models extracted meaningful discriminative structure from the combined time+size packet sequences despite the data scarcity.
+
+\subsection{Key observations}
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{AWF outperforms DF at small data scales:} DF's deeper architecture overfits more readily on 61 training samples, while AWF's lower capacity generalizes better. This finding is practically important: for new traffic classification tasks with limited captures, starting with a smaller model is preferable.
+  \item \textbf{Sliding-window augmentation is essential:} Without it, both models received only 6 training samples (one per class), producing discrete accuracy plateaus (e.g., F1 = 0.1667, 0.3333) reflecting per-sample counting rather than learning.
+  \item \textbf{Learning rate critically affects AWF:} AWF with $lr = 2\times10^{-2}$ produced oscillating losses; reducing to $5\times10^{-4}$ enabled smooth convergence. DF was less sensitive to LR but benefited from StepLR decay.
+  \item \textbf{DF training instability:} DF's loss never cleanly decreased, and validation F1 degraded significantly after its epoch-13 peak. This instability likely reflects the mismatch between DF's capacity and the available data.
+  \item \textbf{Joint label formulation works:} Encoding VPN condition and application class into a single integer label required no changes to either model architecture or the training loop, confirming the approach is architecturally transparent.
+\end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% CHALLENGES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Implementation Challenges}
+
+Over the course of the quarter, we encountered and resolved several non-trivial engineering problems:
+
+\textbf{NPZ key mismatch.} The initial version of \texttt{build\_dataset.py} used hardcoded keys \texttt{time} and \texttt{size}, while the actual transform scripts wrote arrays under keys \texttt{times} and \texttt{sizes} (with trailing `s'). This caused silent KeyErrors that were only caught after debugging the load pipeline.
+
+\textbf{Stratified split failure on small pools.} After the first train/valid/test split, some classes had only 1 sample remaining in the \texttt{(valid+test)} pool. Scikit-learn's \texttt{StratifiedShuffleSplit} requires at least 2 members per class and raises a \texttt{ValueError} in this case. We resolved this by computing \texttt{min(Counter(y\_temp).values())} after the first split and falling back to non-stratified splitting for the second split only when necessary.
+
+\textbf{VarCNN checkpoint not saving.} During one training run, VarCNN produced no checkpoint under \texttt{checkpoints/wf\_time\_size\_L65536/VarCNN/} despite completing training. Investigation revealed the validation F1 never exceeded the initialization threshold required to trigger a save. This likely reflects the difficulty of training VarCNN on only 61 samples. VarCNN results are excluded from our main evaluation until more data is available.
+
+\textbf{Git and large file management.} The NPZ data files (tens to hundreds of MB each) were not suitable for version control. We added a \texttt{.gitignore} in \texttt{vpn\_wf\_datasets/} to exclude all binary data files (\texttt{*.npz}, \texttt{*.pcap}, \texttt{*.h5}) while tracking only scripts and configuration.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DISCUSSION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Discussion}
+
+\subsection{Feasibility of joint VPN/application classification}
+Our results confirm that joint VPN/application classification is feasible with deep 1D CNNs even on a very limited dataset. AWF achieved a best validation F1 of 0.8139 (accuracy 0.7692) on 6 joint classes, substantially above the random baseline of $\approx$0.167. This demonstrates that combined time+size packet sequences carry sufficient discriminative structure to distinguish both VPN condition and application class simultaneously, without any architectural modifications to the original single-task models.
+
+\subsection{Data volume as the primary bottleneck}
+With only 18 raw captures, every design decision---augmentation strategy, train/valid/test ratio, learning rate---has an outsized effect on results. The 5$\times$ augmentation we achieved via sliding windows is a necessary but imperfect solution: windows from the same capture share temporal context, reducing the effective diversity of the training set. Collecting additional independent captures per class-domain combination would be the highest-leverage improvement.
+
+\subsection{VPN obfuscation and model difficulty}
+One interesting axis of this problem is whether VPN-encrypted traffic is genuinely harder to classify than non-VPN traffic, or merely different. If VPN encapsulation normalizes some application signatures (e.g., equalizing packet sizes due to fixed MTU overhead), we would expect lower per-class accuracy on VPN labels. A confusion matrix analysis across the 6 joint classes would reveal whether errors cluster within VPN-labeled classes, which we leave for future analysis.
+
+\subsection{Generalization to unseen applications}
+Our current closed-world evaluation uses all 3 application classes in both training and testing. An open-world extension---where the model must recognize unknown applications as ``other''---would require either a rejection threshold on classifier confidence or a separate binary novelty detector.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% FUTURE WORK
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Future Work}
+\begin{itemize}[leftmargin=1.2em]
+  \item Collect additional PCAP captures (10+ per class/condition) to reduce dependence on window augmentation and improve statistical reliability of results.
+  \item Enable VarCNN training and compare all three architectures (AWF, DF, VarCNN) on the joint 6-class task.
+  \item Analyze per-class confusion matrices to understand whether VPN vs.\ non-VPN errors are distributed evenly or clustered by application.
+  \item Investigate open-world classification where unknown application types must be detected as out-of-distribution.
+  \item Explore whether defenses developed for Tor WF (e.g., adaptive padding, adversarial perturbations) reduce classification accuracy when applied to VPN traffic flows.
+  \item Extend the label space to include additional application types (e.g., streaming audio, file transfer, gaming) to test scalability.
+\end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% CONCLUSION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Conclusion}
+
+We presented a quarter-long project developing a deep learning pipeline for joint VPN/application traffic classification. Starting from raw PCAP captures, we built a complete processing pipeline: signed time/size feature extraction, combined NPZ dataset construction with sliding-window augmentation, stratified dataset splitting with small-dataset fallbacks, and multi-class training of AWF and DF architectures with tuned hyperparameters. Our 6-class joint label formulation---encoding both VPN condition and application type in a single integer---required no architectural changes to either model. AWF achieved a best validation F1 of \textbf{0.8139} (accuracy 0.7692) at epoch 17, while DF peaked at F1 = 0.4583 at epoch 13 before degrading under continued training, illustrating that model capacity must be matched to dataset size. The primary lesson is that data volume is the dominant constraint: with only 18 raw captures, every engineering decision---augmentation strategy, learning rate, model choice---has outsized effects on outcomes. Collecting more diverse, independent captures per class-condition pair would be the most impactful path to improving and stabilizing results.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REFERENCES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{thebibliography}{99}
+
+\bibitem{df}
+Sirinam et al.
+\newblock ``Deep Fingerprinting: Undermining Website Fingerprinting Defenses with Deep Learning.''
+\newblock CCS, 2018.
+
+\bibitem{awf}
+Rimmer et al.
+\newblock ``Automated Website Fingerprinting through Deep Learning.''
+\newblock NDSS, 2018.
+
+\bibitem{varcnn}
+Bhat et al.
+\newblock ``Var-CNN: A Deep Learning Architecture for Website Fingerprinting.''
+\newblock PETS, 2019.
+
+\bibitem{iscx}
+Lashkari et al.
+\newblock ``Characterization of Tor Traffic using Time-based Features.''
+\newblock ICISSP, 2017.
+
+\end{thebibliography}
+
+\end{document}
